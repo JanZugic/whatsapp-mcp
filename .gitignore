@@ -1,3 +1,9 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Session/auth + build artifacts — must never be committed
+whatsapp-bridge/store/
+*.exe
+*.log
+qr.png

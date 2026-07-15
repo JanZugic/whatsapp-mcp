@@ -8,7 +8,15 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+# Bridge REST endpoint. Override host/port via WHATSAPP_API_BASE_URL to avoid the
+# :8080 default clashing with other local services (e.g. the SearXNG container).
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
+# Sends should return quickly; media downloads can legitimately take longer.
+_SEND_TIMEOUT = 30
+_DOWNLOAD_TIMEOUT = 120
+_BRIDGE_DOWN_HINT = (
+    " (is the WhatsApp bridge running? start it with start-bridge.ps1)"
+)
 
 @dataclass
 class Message:
@@ -633,8 +641,8 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "message": message,
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = requests.post(url, json=payload, timeout=_SEND_TIMEOUT)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -644,7 +652,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, f"Request error: {str(e)}{_BRIDGE_DOWN_HINT}"
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -667,8 +675,8 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = requests.post(url, json=payload, timeout=_SEND_TIMEOUT)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -678,7 +686,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, f"Request error: {str(e)}{_BRIDGE_DOWN_HINT}"
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -707,8 +715,8 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = requests.post(url, json=payload, timeout=_SEND_TIMEOUT)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -718,7 +726,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, f"Request error: {str(e)}{_BRIDGE_DOWN_HINT}"
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -740,8 +748,8 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "message_id": message_id,
             "chat_jid": chat_jid
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = requests.post(url, json=payload, timeout=_DOWNLOAD_TIMEOUT)
         
         if response.status_code == 200:
             result = response.json()
