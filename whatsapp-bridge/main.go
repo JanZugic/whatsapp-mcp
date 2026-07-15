@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -19,6 +26,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"golang.org/x/crypto/hkdf"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -467,6 +476,21 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Auto-download media on receipt, while the blob is still fresh on WhatsApp's CDN.
+		// (On-demand downloads of old messages fail with HTTP 403 once the server purges the blob.)
+		// Run in a goroutine so we never block the event handler.
+		if mediaType != "" && url != "" && len(mediaKey) > 0 {
+			msgID := msg.Info.ID
+			go func() {
+				ok, _, fname, path, derr := downloadMedia(client, messageStore, msgID, chatJID)
+				if derr != nil {
+					fmt.Printf("[auto-download] failed for %s (%s): %v\n", msgID, mediaType, derr)
+				} else if ok {
+					fmt.Printf("[auto-download] saved %s -> %s\n", fname, path)
+				}
+			}()
+		}
 	}
 }
 
@@ -641,9 +665,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		// whatsmeow reconstructs and re-signs the direct path, which can fail
+		// (403/410) even when the original signed URL is still valid. Fall back
+		// to fetching the original URL and decrypting it ourselves.
+		fmt.Printf("whatsmeow download failed (%v); trying direct URL decrypt...\n", err)
+		mediaData, err = downloadAndDecryptManual(url, mediaKey, mediaType, fileSHA256)
+		if err != nil {
+			return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -653,6 +684,97 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// mediaHKDFInfo returns the HKDF application-info string WhatsApp uses per media type.
+func mediaHKDFInfo(mediaType string) (string, error) {
+	switch mediaType {
+	case "image":
+		return "WhatsApp Image Keys", nil
+	case "video":
+		return "WhatsApp Video Keys", nil
+	case "audio":
+		return "WhatsApp Audio Keys", nil
+	case "document":
+		return "WhatsApp Document Keys", nil
+	default:
+		return "", fmt.Errorf("unsupported media type: %s", mediaType)
+	}
+}
+
+// downloadAndDecryptManual fetches the original signed .enc URL and decrypts it
+// using the stored media key, mirroring WhatsApp's media encryption scheme. This
+// is a fallback for when whatsmeow's direct-path download fails.
+func downloadAndDecryptManual(url string, mediaKey []byte, mediaType string, fileSHA256 []byte) ([]byte, error) {
+	info, err := mediaHKDFInfo(mediaType)
+	if err != nil {
+		return nil, err
+	}
+
+	// Expand the 32-byte media key into 112 bytes: iv(16) | cipherKey(32) | macKey(32) | ref(32)
+	expanded := make([]byte, 112)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, mediaKey, nil, []byte(info)), expanded); err != nil {
+		return nil, fmt.Errorf("hkdf expand: %v", err)
+	}
+	iv, cipherKey, macKey := expanded[0:16], expanded[16:48], expanded[48:80]
+
+	// Fetch the encrypted blob
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("fetch enc: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch enc: status %d", resp.StatusCode)
+	}
+	enc, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read enc: %v", err)
+	}
+	if len(enc) <= 10 {
+		return nil, fmt.Errorf("enc too short: %d bytes", len(enc))
+	}
+
+	ciphertext, mac := enc[:len(enc)-10], enc[len(enc)-10:]
+
+	// Verify MAC = HMAC-SHA256(macKey, iv||ciphertext)[:10]
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(ciphertext)
+	if !hmac.Equal(h.Sum(nil)[:10], mac) {
+		return nil, fmt.Errorf("media MAC mismatch")
+	}
+
+	// AES-256-CBC decrypt
+	block, err := aes.NewCipher(cipherKey)
+	if err != nil {
+		return nil, fmt.Errorf("aes cipher: %v", err)
+	}
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext not block-aligned")
+	}
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plaintext, ciphertext)
+
+	// Strip PKCS#7 padding
+	if len(plaintext) == 0 {
+		return nil, fmt.Errorf("empty plaintext")
+	}
+	pad := int(plaintext[len(plaintext)-1])
+	if pad <= 0 || pad > aes.BlockSize || pad > len(plaintext) {
+		return nil, fmt.Errorf("invalid padding: %d", pad)
+	}
+	plaintext = plaintext[:len(plaintext)-pad]
+
+	// Verify plaintext hash if we have it
+	if len(fileSHA256) > 0 {
+		sum := sha256.Sum256(plaintext)
+		if !hmac.Equal(sum[:], fileSHA256) {
+			return nil, fmt.Errorf("decrypted file SHA-256 mismatch")
+		}
+	}
+
+	return plaintext, nil
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -774,9 +896,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Start the server — bind to loopback only so the unauthenticated API is NOT
+	// reachable from the local network or internet (only this machine can call it).
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("Starting REST API server on %s (localhost only)...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
@@ -800,14 +923,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -867,10 +990,29 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
+		browserOpened := false
+		htmlPath, _ := filepath.Abs("store/qr.html")
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Also render the QR as a PNG in the browser for easy scanning
+				if code, qrErr := qr.Encode(evt.Code, qr.M); qrErr == nil {
+					b64 := base64.StdEncoding.EncodeToString(code.PNG())
+					html := "<!doctype html><html><head><meta charset=\"utf-8\">" +
+						"<meta http-equiv=\"refresh\" content=\"2\">" +
+						"<title>Scan WhatsApp QR</title>" +
+						"<style>body{background:#111;color:#eee;font-family:sans-serif;text-align:center;padding:24px}" +
+						"img{width:360px;height:360px;background:#fff;padding:16px;border-radius:8px}</style></head>" +
+						"<body><h2>WhatsApp &rarr; Settings &rarr; Linked Devices &rarr; Link a device</h2>" +
+						"<img src=\"data:image/png;base64," + b64 + "\">" +
+						"<p>This page auto-refreshes. Keep the bridge terminal running after it connects.</p></body></html>"
+					if werr := os.WriteFile("store/qr.html", []byte(html), 0644); werr == nil && !browserOpened {
+						exec.Command("cmd", "/c", "start", "", htmlPath).Start()
+						browserOpened = true
+						fmt.Printf("Opened QR in your browser: %s\n", htmlPath)
+					}
+				}
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -973,7 +1115,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1130,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
